@@ -193,6 +193,46 @@ void RedisCluster::DnsDiscoveryResolveTarget::startResolveDns() {
       });
 }
 
+// TODO: This is copied straight from startResolveDns
+//       mainly to avoid triggering startResolveRedis, we want to push to onClusterSlotUpdate
+RedisCluster::DnsDiscoveryResolveTarget::startResolveClusterSlotDns() {
+  ENVOY_LOG(trace, "starting async DNS resolution for {}", dns_address_);
+
+  active_query_ = parent_.dns_resolver_->resolve(
+      dns_address_, parent_.dns_lookup_family_,
+      [this](Network::DnsResolver::ResolutionStatus status,
+             std::list<Network::DnsResponse>&& response) -> void {
+        active_query_ = nullptr;
+        ENVOY_LOG(trace, "async DNS resolution complete for {}", dns_address_);
+        if (status == Network::DnsResolver::ResolutionStatus::Failure || response.empty()) {
+          if (status == Network::DnsResolver::ResolutionStatus::Failure) {
+            parent_.info_->stats().update_failure_.inc();
+          } else {
+            parent_.info_->stats().update_empty_.inc();
+          }
+
+          if (!resolve_timer_) {
+            resolve_timer_ =
+                parent_.dispatcher_.createTimer([this]() -> void { startResolveDns(); });
+          }
+          // if the initial dns resolved to empty, we'll skip the redis discovery phase and
+          // treat it as an empty cluster.
+          parent_.onPreInitComplete();
+          resolve_timer_->enableTimer(parent_.cluster_refresh_rate_);
+        } else {
+          auto first_instance = response[0];
+          auto ipv4 = Network::Utility::getAddressWithPort(*(first_instance.address_), port);
+          auto address = Network::Utility::parseInternetAddressNoThrow(ipv4, port_, false);
+          if (address != nullptr) {
+              auto slots = std::make_unique<std::vector<ClusterSlot>>();
+              slots->emplace_back(slot_range[SlotRangeStart].asInteger(),
+                        slot_range[SlotRangeEnd].asInteger(), address);
+              parent_.onClusterSlotUpdate(std::move(slots));
+          }
+        }
+      });
+}
+
 // RedisCluster
 RedisCluster::RedisDiscoverySession::RedisDiscoverySession(
     Envoy::Extensions::Clusters::Redis::RedisCluster& parent,
@@ -219,12 +259,17 @@ RedisCluster::RedisDiscoverySession::RedisDiscoverySession::ProcessCluster(
     return nullptr;
   }
 
-  try {
-    return Network::Utility::parseInternetAddress(array[0].asString(), array[1].asInteger(), false);
-  } catch (const EnvoyException& ex) {
-    ENVOY_LOG(debug, "Invalid ip address in CLUSTER SLOTS response: {}", ex.what());
-    return nullptr;
+  auto address = Network::Utility::parseInternetAddressNoThrow(array[0].asString(), array[1].asInteger(), false);
+  if (address != nullptr) {
+    return address;
+  } else {
+    // If address is a nullptr we might have gotten a hostname back
+    // try to resolve the hostname to an ip address before returning
+    auto target = new DnsDiscoveryResolveTarget(
+          *this, array[0].asString(), array[1].asInteger());
+    target->startResolveClusterSlotDns();
   }
+  return nullptr
 }
 
 RedisCluster::RedisDiscoverySession::~RedisDiscoverySession() {
@@ -311,8 +356,6 @@ void RedisCluster::RedisDiscoverySession::onResponse(
     return;
   }
 
-  auto slots = std::make_unique<std::vector<ClusterSlot>>();
-
   // Loop through the cluster slot response and error checks for each field.
   for (const NetworkFilters::Common::Redis::RespValue& part : value->asArray()) {
     if (part.type() != NetworkFilters::Common::Redis::RespType::Array) {
@@ -330,6 +373,8 @@ void RedisCluster::RedisDiscoverySession::onResponse(
       onUnexpectedResponse(value);
       return;
     }
+
+    auto slots = std::make_unique<std::vector<ClusterSlot>>();
 
     // Field 2: Primary address for slot range
     auto primary_address = ProcessCluster(slot_range[SlotPrimary]);

@@ -171,6 +171,7 @@ private:
     ~DnsDiscoveryResolveTarget();
 
     void startResolveDns();
+    void startResolveClusterSlotDns();
 
     RedisCluster& parent_;
     Network::ActiveDnsQuery* active_query_{};
